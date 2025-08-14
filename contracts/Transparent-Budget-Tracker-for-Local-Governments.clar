@@ -8,6 +8,8 @@
 (define-constant ERR-ALREADY-APPROVED (err u201))
 (define-constant ERR-INSUFFICIENT-APPROVALS (err u202))
 (define-constant ERR-TRANSFER-FAILED (err u203))
+(define-constant ERR-VARIANCE-EXISTS (err u204))
+(define-constant ERR-VARIANCE-NOT-FOUND (err u205))
 
 (define-data-var governance-token-address principal 'SP000000000000000000002Q6VF78.governance-token)
 (define-data-var min-votes uint u100)
@@ -99,10 +101,34 @@
     }
 )
 
+(define-map budget-variances
+    { variance-id: uint }
+    {
+        project-id: uint,
+        budgeted-amount: uint,
+        actual-amount: uint,
+        variance-percentage: int,
+        variance-status: (string-ascii 20),
+        created-at: uint,
+        analysis-period: uint
+    }
+)
+
+(define-map project-variance-tracking
+    { project-id: uint }
+    {
+        current-variance-id: uint,
+        total-budget-allocated: uint,
+        total-amount-spent: uint,
+        last-updated: uint
+    }
+)
+
 (define-data-var project-counter uint u0)
 (define-data-var request-counter uint u0)
 (define-data-var category-counter uint u0)
 (define-data-var report-counter uint u0)
+(define-data-var variance-counter uint u0)
 
 (define-public (create-project (name (string-ascii 50)) (description (string-ascii 200)) (total-budget uint))
     (let ((project-id (+ (var-get project-counter) u1)))
@@ -379,4 +405,123 @@
 
 (define-private (count-completed-projects)
     u5
+)
+
+(define-public (create-budget-variance (project-id uint) (budgeted-amount uint) (actual-amount uint))
+    (let (
+        (variance-id (+ (var-get variance-counter) u1))
+        (variance-percentage (calculate-variance-percentage budgeted-amount actual-amount))
+        (variance-status (determine-variance-status variance-percentage))
+    )
+        (asserts! (is-some (map-get? projects { project-id: project-id })) ERR-PROJECT-NOT-FOUND)
+        (asserts! (> budgeted-amount u0) ERR-INVALID-AMOUNT)
+        (map-insert budget-variances
+            { variance-id: variance-id }
+            {
+                project-id: project-id,
+                budgeted-amount: budgeted-amount,
+                actual-amount: actual-amount,
+                variance-percentage: variance-percentage,
+                variance-status: variance-status,
+                created-at: stacks-block-height,
+                analysis-period: u30
+            }
+        )
+        (map-set project-variance-tracking
+            { project-id: project-id }
+            {
+                current-variance-id: variance-id,
+                total-budget-allocated: budgeted-amount,
+                total-amount-spent: actual-amount,
+                last-updated: stacks-block-height
+            }
+        )
+        (var-set variance-counter variance-id)
+        (ok variance-id)
+    )
+)
+
+(define-public (update-project-spending (project-id uint) (new-spending uint))
+    (let (
+        (project (unwrap! (map-get? projects { project-id: project-id }) ERR-PROJECT-NOT-FOUND))
+        (current-tracking (unwrap! (map-get? project-variance-tracking { project-id: project-id }) ERR-VARIANCE-NOT-FOUND))
+    )
+        (asserts! (> new-spending u0) ERR-INVALID-AMOUNT)
+        (let (
+            (updated-total (+ (get total-amount-spent current-tracking) new-spending))
+            (variance-percentage (calculate-variance-percentage (get total-budget-allocated current-tracking) updated-total))
+            (variance-status (determine-variance-status variance-percentage))
+            (variance-id (+ (var-get variance-counter) u1))
+        )
+            (map-insert budget-variances
+                { variance-id: variance-id }
+                {
+                    project-id: project-id,
+                    budgeted-amount: (get total-budget-allocated current-tracking),
+                    actual-amount: updated-total,
+                    variance-percentage: variance-percentage,
+                    variance-status: variance-status,
+                    created-at: stacks-block-height,
+                    analysis-period: u30
+                }
+            )
+            (map-set project-variance-tracking
+                { project-id: project-id }
+                {
+                    current-variance-id: variance-id,
+                    total-budget-allocated: (get total-budget-allocated current-tracking),
+                    total-amount-spent: updated-total,
+                    last-updated: stacks-block-height
+                }
+            )
+            (var-set variance-counter variance-id)
+            (ok variance-id)
+        )
+    )
+)
+
+(define-read-only (get-budget-variance (variance-id uint))
+    (ok (unwrap! (map-get? budget-variances { variance-id: variance-id }) ERR-VARIANCE-NOT-FOUND))
+)
+
+(define-read-only (get-project-variance-status (project-id uint))
+    (ok (map-get? project-variance-tracking { project-id: project-id }))
+)
+
+(define-read-only (check-budget-alerts (project-id uint))
+    (match (map-get? project-variance-tracking { project-id: project-id })
+        tracking (let (
+            (variance-percentage (calculate-variance-percentage 
+                (get total-budget-allocated tracking) 
+                (get total-amount-spent tracking)
+            ))
+        )
+            (ok {
+                over-budget: (> variance-percentage 0),
+                critical-alert: (> variance-percentage 25),
+                variance-percentage: variance-percentage
+            })
+        )
+        (ok { over-budget: false, critical-alert: false, variance-percentage: 0 })
+    )
+)
+
+(define-private (calculate-variance-percentage (budgeted uint) (actual uint))
+    (if (is-eq budgeted u0)
+        0
+        (/ (* (- (to-int actual) (to-int budgeted)) 100) (to-int budgeted))
+    )
+)
+
+(define-private (determine-variance-status (variance-percentage int))
+    (if (> variance-percentage 25)
+        "critical-overspend"
+        (if (> variance-percentage 0)
+            "over-budget"
+            (if (< variance-percentage -10)
+                "under-budget"
+                "on-track"
+            )
+        )
+    )
 )
