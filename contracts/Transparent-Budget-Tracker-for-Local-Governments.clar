@@ -10,6 +10,8 @@
 (define-constant ERR-TRANSFER-FAILED (err u203))
 (define-constant ERR-VARIANCE-EXISTS (err u204))
 (define-constant ERR-VARIANCE-NOT-FOUND (err u205))
+(define-constant ERR-COMPLAINT-NOT-FOUND (err u206))
+(define-constant ERR-INVALID-STATUS (err u207))
 
 (define-data-var governance-token-address principal 'SP000000000000000000002Q6VF78.governance-token)
 (define-data-var min-votes uint u100)
@@ -124,11 +126,27 @@
     }
 )
 
+(define-map citizen-complaints
+    { complaint-id: uint }
+    {
+        citizen: principal,
+        project-id: (optional uint),
+        category: (string-ascii 30),
+        description: (string-ascii 300),
+        severity: (string-ascii 20),
+        status: (string-ascii 20),
+        filed-at: uint,
+        resolved-at: (optional uint),
+        resolution-notes: (optional (string-ascii 200))
+    }
+)
+
 (define-data-var project-counter uint u0)
 (define-data-var request-counter uint u0)
 (define-data-var category-counter uint u0)
 (define-data-var report-counter uint u0)
 (define-data-var variance-counter uint u0)
+(define-data-var complaint-counter uint u0)
 
 (define-public (create-project (name (string-ascii 50)) (description (string-ascii 200)) (total-budget uint))
     (let ((project-id (+ (var-get project-counter) u1)))
@@ -524,4 +542,71 @@
             )
         )
     )
+)
+
+(define-public (file-complaint (project-id (optional uint)) (category (string-ascii 30)) (description (string-ascii 300)) (severity (string-ascii 20)))
+    (let ((complaint-id (+ (var-get complaint-counter) u1)))
+        (map-insert citizen-complaints
+            { complaint-id: complaint-id }
+            {
+                citizen: tx-sender,
+                project-id: project-id,
+                category: category,
+                description: description,
+                severity: severity,
+                status: "open",
+                filed-at: stacks-block-height,
+                resolved-at: none,
+                resolution-notes: none
+            }
+        )
+        (var-set complaint-counter complaint-id)
+        (ok complaint-id)
+    )
+)
+
+(define-public (update-complaint-status (complaint-id uint) (new-status (string-ascii 20)) (resolution-notes (optional (string-ascii 200))))
+    (let ((complaint (unwrap! (map-get? citizen-complaints { complaint-id: complaint-id }) ERR-COMPLAINT-NOT-FOUND)))
+        (asserts! (default-to false (map-get? treasury-members tx-sender)) ERR-NOT-TREASURY-MEMBER)
+        (asserts! (or (is-eq new-status "in-progress") (is-eq new-status "resolved") (is-eq new-status "dismissed")) ERR-INVALID-STATUS)
+        (map-set citizen-complaints
+            { complaint-id: complaint-id }
+            (merge complaint {
+                status: new-status,
+                resolved-at: (if (is-eq new-status "resolved") (some stacks-block-height) (get resolved-at complaint)),
+                resolution-notes: resolution-notes
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (respond-to-complaint (complaint-id uint) (response (string-ascii 200)))
+    (let ((complaint (unwrap! (map-get? citizen-complaints { complaint-id: complaint-id }) ERR-COMPLAINT-NOT-FOUND)))
+        (asserts! (default-to false (map-get? treasury-members tx-sender)) ERR-NOT-TREASURY-MEMBER)
+        (map-set citizen-complaints
+            { complaint-id: complaint-id }
+            (merge complaint { resolution-notes: (some response) })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-complaint (complaint-id uint))
+    (ok (unwrap! (map-get? citizen-complaints { complaint-id: complaint-id }) ERR-COMPLAINT-NOT-FOUND))
+)
+
+(define-read-only (get-complaints-by-status (status (string-ascii 20)))
+    (ok status)
+)
+
+(define-read-only (get-complaints-by-citizen (citizen principal))
+    (ok citizen)
+)
+
+(define-read-only (get-complaint-stats)
+    (ok {
+        total-complaints: (var-get complaint-counter),
+        recent-complaints: u0
+    })
 )
