@@ -12,6 +12,9 @@
 (define-constant ERR-VARIANCE-NOT-FOUND (err u205))
 (define-constant ERR-COMPLAINT-NOT-FOUND (err u206))
 (define-constant ERR-INVALID-STATUS (err u207))
+(define-constant ERR-AUDIT-LOG-NOT-FOUND (err u208))
+(define-constant ERR-INVALID-AUDIT-TYPE (err u209))
+(define-constant ERR-AUDIT-ACCESS-DENIED (err u210))
 
 (define-data-var governance-token-address principal 'SP000000000000000000002Q6VF78.governance-token)
 (define-data-var min-votes uint u100)
@@ -141,12 +144,61 @@
     }
 )
 
+;; === AUDIT TRAIL FEATURE ===
+;; Comprehensive audit logging for all financial operations
+(define-map audit-logs
+    { audit-id: uint }
+    {
+        operation-type: (string-ascii 30),
+        entity-type: (string-ascii 20),
+        entity-id: uint,
+        actor: principal,
+        action: (string-ascii 50),
+        amount: (optional uint),
+        previous-value: (optional (string-ascii 100)),
+        new-value: (optional (string-ascii 100)),
+        metadata: (string-ascii 200),
+        timestamp: uint,
+        block-height: uint,
+        transaction-hash: (buff 32)
+    }
+)
+
+(define-map audit-trail-access-control
+    { accessor: principal }
+    { access-level: (string-ascii 20), granted-at: uint }
+)
+
+(define-map daily-audit-summaries
+    { date: uint }
+    {
+        total-operations: uint,
+        fund-operations: uint,
+        project-operations: uint,
+        treasury-operations: uint,
+        complaint-operations: uint,
+        total-amount-tracked: uint,
+        unique-actors: uint
+    }
+)
+
+(define-map operation-integrity-hashes
+    { operation-id: uint }
+    {
+        hash: (buff 32),
+        previous-hash: (buff 32),
+        merkle-root: (buff 32),
+        verification-status: (string-ascii 20)
+    }
+)
+
 (define-data-var project-counter uint u0)
 (define-data-var request-counter uint u0)
 (define-data-var category-counter uint u0)
 (define-data-var report-counter uint u0)
 (define-data-var variance-counter uint u0)
 (define-data-var complaint-counter uint u0)
+(define-data-var audit-log-counter uint u0)
 
 (define-public (create-project (name (string-ascii 50)) (description (string-ascii 200)) (total-budget uint))
     (let ((project-id (+ (var-get project-counter) u1)))
@@ -610,3 +662,237 @@
         recent-complaints: u0
     })
 )
+
+;; === AUDIT TRAIL PUBLIC FUNCTIONS ===
+
+(define-public (log-audit-entry (operation-type (string-ascii 30)) (entity-type (string-ascii 20)) (entity-id uint) (action (string-ascii 50)) (amount (optional uint)) (previous-value (optional (string-ascii 100))) (new-value (optional (string-ascii 100))) (metadata (string-ascii 200)))
+    (let (
+        (audit-id (+ (var-get audit-log-counter) u1))
+        (current-timestamp stacks-block-height)
+        (tx-hash (unwrap-panic (get-tx-hash)))
+    )
+        (asserts! 
+            (or 
+                (is-eq operation-type "fund-transfer")
+                (is-eq operation-type "project-creation")
+                (is-eq operation-type "milestone-completion")
+                (is-eq operation-type "treasury-action")
+                (is-eq operation-type "complaint-action")
+                (is-eq operation-type "budget-variance")
+                (is-eq operation-type "report-generation")
+            ) 
+            ERR-INVALID-AUDIT-TYPE
+        )
+        (map-insert audit-logs
+            { audit-id: audit-id }
+            {
+                operation-type: operation-type,
+                entity-type: entity-type,
+                entity-id: entity-id,
+                actor: tx-sender,
+                action: action,
+                amount: amount,
+                previous-value: previous-value,
+                new-value: new-value,
+                metadata: metadata,
+                timestamp: current-timestamp,
+                block-height: current-timestamp,
+                transaction-hash: tx-hash
+            }
+        )
+        (unwrap-panic (update-daily-audit-summary operation-type amount))
+        (unwrap-panic (create-integrity-hash audit-id))
+        (var-set audit-log-counter audit-id)
+        (ok audit-id)
+    )
+)
+
+(define-public (grant-audit-access (accessor principal) (access-level (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (asserts! 
+            (or 
+                (is-eq access-level "read-only")
+                (is-eq access-level "auditor")
+                (is-eq access-level "admin")
+            ) 
+            ERR-INVALID-AUDIT-TYPE
+        )
+        (map-set audit-trail-access-control
+            { accessor: accessor }
+            { access-level: access-level, granted-at: stacks-block-height }
+        )
+        (unwrap-panic (log-audit-entry "treasury-action" "access-control" u0 "grant-audit-access" none none (some access-level) "Granted audit access"))
+        (ok true)
+    )
+)
+
+(define-public (revoke-audit-access (accessor principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (map-get? audit-trail-access-control { accessor: accessor })) ERR-AUDIT-ACCESS-DENIED)
+        (map-delete audit-trail-access-control { accessor: accessor })
+        (unwrap-panic (log-audit-entry "treasury-action" "access-control" u0 "revoke-audit-access" none none none "Revoked audit access"))
+        (ok true)
+    )
+)
+
+(define-public (generate-audit-report (start-date uint) (end-date uint) (operation-filter (optional (string-ascii 30))))
+    (let (
+        (has-access (check-audit-access tx-sender))
+        (report-id (+ (var-get audit-log-counter) u1000000)) ;; Use high number for report IDs
+    )
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (asserts! (<= start-date end-date) ERR-INVALID-AMOUNT)
+        (unwrap-panic (log-audit-entry "report-generation" "audit-report" report-id "generate-audit-report" none none none "Generated audit report"))
+        (ok {
+            report-id: report-id,
+            period-start: start-date,
+            period-end: end-date,
+            operation-filter: operation-filter,
+            generated-at: stacks-block-height,
+            generated-by: tx-sender
+        })
+    )
+)
+
+(define-public (verify-operation-integrity (operation-id uint))
+    (let (
+        (integrity-data (map-get? operation-integrity-hashes { operation-id: operation-id }))
+        (has-access (check-audit-access tx-sender))
+    )
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (match integrity-data
+            data (let (
+                (current-hash (get hash data))
+                (verification-result (verify-hash current-hash operation-id))
+            )
+                (map-set operation-integrity-hashes
+                    { operation-id: operation-id }
+                    (merge data { verification-status: (if verification-result "verified" "tampered") })
+                )
+                (ok verification-result)
+            )
+            ERR-AUDIT-LOG-NOT-FOUND
+        )
+    )
+)
+
+;; === AUDIT TRAIL READ-ONLY FUNCTIONS ===
+
+(define-read-only (get-audit-log (audit-id uint))
+    (let ((has-access (check-audit-access tx-sender)))
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (ok (unwrap! (map-get? audit-logs { audit-id: audit-id }) ERR-AUDIT-LOG-NOT-FOUND))
+    )
+)
+
+(define-read-only (get-audit-access-level (accessor principal))
+    (ok (map-get? audit-trail-access-control { accessor: accessor }))
+)
+
+(define-read-only (get-daily-audit-summary (date uint))
+    (let ((has-access (check-audit-access tx-sender)))
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (ok (map-get? daily-audit-summaries { date: date }))
+    )
+)
+
+(define-read-only (get-operation-integrity (operation-id uint))
+    (let ((has-access (check-audit-access tx-sender)))
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (ok (map-get? operation-integrity-hashes { operation-id: operation-id }))
+    )
+)
+
+(define-read-only (get-audit-statistics)
+    (let ((has-access (check-audit-access tx-sender)))
+        (asserts! has-access ERR-AUDIT-ACCESS-DENIED)
+        (ok {
+            total-audit-logs: (var-get audit-log-counter),
+            current-block: stacks-block-height,
+            contract-version: "v1.0.0"
+        })
+    )
+)
+
+;; === AUDIT TRAIL PRIVATE HELPER FUNCTIONS ===
+
+(define-private (check-audit-access (accessor principal))
+    (let ((access-data (map-get? audit-trail-access-control { accessor: accessor })))
+        (match access-data
+            data (not (is-eq (get access-level data) "none"))
+            false
+        )
+    )
+)
+
+(define-private (update-daily-audit-summary (operation-type (string-ascii 30)) (amount (optional uint)))
+    (let (
+        (today (/ stacks-block-height u144)) ;; Approximate blocks per day
+        (current-summary (default-to 
+            { total-operations: u0, fund-operations: u0, project-operations: u0, treasury-operations: u0, complaint-operations: u0, total-amount-tracked: u0, unique-actors: u0 }
+            (map-get? daily-audit-summaries { date: today })
+        ))
+        (amount-to-add (default-to u0 amount))
+    )
+        (map-set daily-audit-summaries
+            { date: today }
+            {
+                total-operations: (+ (get total-operations current-summary) u1),
+                fund-operations: (+ (get fund-operations current-summary) (if (is-eq operation-type "fund-transfer") u1 u0)),
+                project-operations: (+ (get project-operations current-summary) (if (is-eq operation-type "project-creation") u1 u0)),
+                treasury-operations: (+ (get treasury-operations current-summary) (if (is-eq operation-type "treasury-action") u1 u0)),
+                complaint-operations: (+ (get complaint-operations current-summary) (if (is-eq operation-type "complaint-action") u1 u0)),
+                total-amount-tracked: (+ (get total-amount-tracked current-summary) amount-to-add),
+                unique-actors: (+ (get unique-actors current-summary) u1) ;; Simplified - in real implementation would track unique actors
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-private (create-integrity-hash (audit-id uint))
+    (let (
+        (audit-data (unwrap! (map-get? audit-logs { audit-id: audit-id }) (err u500)))
+        (previous-hash (if (> audit-id u1) 
+                        (get hash (default-to { hash: 0x00, previous-hash: 0x00, merkle-root: 0x00, verification-status: "initial" }
+                                             (map-get? operation-integrity-hashes { operation-id: (- audit-id u1) })))
+                        0x00))
+        (current-hash (hash160 (unwrap-panic (to-consensus-buff? audit-data))))
+        (merkle-root (hash160 current-hash))
+    )
+        (map-insert operation-integrity-hashes
+            { operation-id: audit-id }
+            {
+                hash: current-hash,
+                previous-hash: previous-hash,
+                merkle-root: merkle-root,
+                verification-status: "verified"
+            }
+        )
+        (ok current-hash)
+    )
+)
+
+(define-private (verify-hash (hash-to-verify (buff 32)) (operation-id uint))
+    (let (
+        (audit-data (unwrap! (map-get? audit-logs { audit-id: operation-id }) false))
+        (previous-hash (if (> operation-id u1)
+                        (get hash (default-to { hash: 0x00, previous-hash: 0x00, merkle-root: 0x00, verification-status: "initial" }
+                                             (map-get? operation-integrity-hashes { operation-id: (- operation-id u1) })))
+                        0x00))
+        (calculated-hash (hash160 (unwrap-panic (to-consensus-buff? audit-data))))
+    )
+        (is-eq hash-to-verify calculated-hash)
+    )
+)
+
+(define-private (get-tx-hash)
+    (ok 0x0000000000000000000000000000000000000000000000000000000000000000) ;; Placeholder - in real implementation would get actual tx hash
+)
+
+(define-private (uint-to-ascii (value uint))
+    "0" ;; Simplified - in real implementation would convert uint to string
+)
+
