@@ -199,6 +199,44 @@
 (define-data-var variance-counter uint u0)
 (define-data-var complaint-counter uint u0)
 (define-data-var audit-log-counter uint u0)
+(define-data-var analytics-counter uint u0)
+
+(define-map project-performance
+    { project-id: uint }
+    {
+        total-allocated: uint,
+        total-spent: uint,
+        milestones-completed: uint,
+        milestones-total: uint,
+        efficiency-score: uint,
+        last-calculated: uint
+    }
+)
+
+(define-map performance-metrics
+    { metric-id: uint }
+    {
+        project-id: uint,
+        period-start: uint,
+        period-end: uint,
+        budget-utilization-rate: uint,
+        time-efficiency: uint,
+        cost-efficiency: uint,
+        roi-percentage: int,
+        performance-grade: (string-ascii 10),
+        calculated-at: uint
+    }
+)
+
+(define-map project-roi-history
+    { project-id: uint, roi-record-id: uint }
+    {
+        reporting-period: uint,
+        roi-value: int,
+        quality-score: uint,
+        stakeholder-satisfaction: uint
+    }
+)
 
 (define-public (create-project (name (string-ascii 50)) (description (string-ascii 200)) (total-budget uint))
     (let ((project-id (+ (var-get project-counter) u1)))
@@ -896,3 +934,93 @@
     "0" ;; Simplified - in real implementation would convert uint to string
 )
 
+(define-private (calculate-budget-utilization (spent uint) (allocated uint))
+    (if (is-eq allocated u0)
+        u0
+        (/ (* spent u100) allocated)
+    )
+)
+
+(define-private (calculate-cost-efficiency (spent uint) (allocated uint))
+    (if (is-eq allocated u0)
+        u0
+        (let ((util (/ (* spent u100) allocated)))
+            (if (> util u100)
+                u0
+                (- u100 util)
+            )
+        )
+    )
+)
+
+(define-private (calculate-roi (benefit uint) (spent uint))
+    (if (is-eq spent u0)
+        0
+        (/ (* (- (to-int benefit) (to-int spent)) 100) (to-int spent))
+    )
+)
+
+(define-private (determine-performance-grade (util uint) (cost uint))
+    (let ((avg (/ (+ util cost) u2)))
+        (if (> avg u85)
+            "A"
+            (if (> avg u75)
+                "B"
+                (if (> avg u65)
+                    "C"
+                    "D"
+                )
+            )
+        )
+    )
+)
+
+(define-public (record-performance (project-id uint) (total-allocated uint) (total-spent uint) (milestones-total uint) (milestones-completed uint) (period-start uint) (period-end uint) (external-benefit uint))
+    (let (
+        (project (unwrap! (map-get? projects { project-id: project-id }) ERR-PROJECT-NOT-FOUND))
+        (metric-id (+ (var-get analytics-counter) u1))
+        (util (calculate-budget-utilization total-spent total-allocated))
+        (time-eff (if (is-eq milestones-total u0) u0 (/ (* milestones-completed u100) milestones-total)))
+        (cost-eff (calculate-cost-efficiency total-spent total-allocated))
+        (roi (calculate-roi external-benefit total-spent))
+        (grade (determine-performance-grade util cost-eff))
+        (eff-score (/ (+ util time-eff) u2))
+    )
+        (asserts! (<= period-start period-end) ERR-INVALID-AMOUNT)
+        (map-set project-performance
+            { project-id: project-id }
+            {
+                total-allocated: total-allocated,
+                total-spent: total-spent,
+                milestones-completed: milestones-completed,
+                milestones-total: milestones-total,
+                efficiency-score: eff-score,
+                last-calculated: stacks-block-height
+            }
+        )
+        (map-insert performance-metrics
+            { metric-id: metric-id }
+            {
+                project-id: project-id,
+                period-start: period-start,
+                period-end: period-end,
+                budget-utilization-rate: util,
+                time-efficiency: time-eff,
+                cost-efficiency: cost-eff,
+                roi-percentage: roi,
+                performance-grade: grade,
+                calculated-at: stacks-block-height
+            }
+        )
+        (var-set analytics-counter metric-id)
+        (ok metric-id)
+    )
+)
+
+(define-read-only (get-project-performance (project-id uint))
+    (ok (map-get? project-performance { project-id: project-id }))
+)
+
+(define-read-only (get-performance-metric (metric-id uint))
+    (ok (map-get? performance-metrics { metric-id: metric-id }))
+)
